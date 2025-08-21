@@ -1,0 +1,498 @@
+# Create a complete Flask app project with CRUD for crafts and detailed reports.
+# We'll generate a small project structure, then zip it for easy download.
+import os, textwrap, json, zipfile, pathlib, datetime
+
+base = "/mnt/data/crafts_manager_flask"
+os.makedirs(base, exist_ok=True)
+os.makedirs(f"{base}/templates", exist_ok=True)
+os.makedirs(f"{base}/static", exist_ok=True)
+
+# requirements.txt
+requirements = """\
+Flask==3.0.3
+Flask-SQLAlchemy==3.1.1
+"""
+open(f"{base}/requirements.txt","w").write(requirements)
+
+# app.py
+app_py = r'''from flask import Flask, render_template, request, redirect, url_for, flash, send_file
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.sql import func
+import csv, io, datetime
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'dev-secret'  # replace in production
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///crafts.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+
+# -------------------- Models --------------------
+class Craft(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    category = db.Column(db.String(80), nullable=False)
+    materials = db.Column(db.String(200), default='')
+    cost = db.Column(db.Float, default=0.0)     # cost to make one item
+    price = db.Column(db.Float, default=0.0)    # selling price per item
+    quantity = db.Column(db.Integer, default=0) # inventory on hand
+    notes = db.Column(db.Text, default='')
+    created_at = db.Column(db.DateTime, server_default=func.now())
+    updated_at = db.Column(db.DateTime, onupdate=func.now())
+
+    sales = db.relationship('Sale', backref='craft', cascade='all,delete-orphan')
+
+    def inventory_value(self):
+        return self.cost * self.quantity
+
+    def potential_revenue(self):
+        return self.price * self.quantity
+
+
+class Sale(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    craft_id = db.Column(db.Integer, db.ForeignKey('craft.id'), nullable=False)
+    units = db.Column(db.Integer, nullable=False)
+    unit_price = db.Column(db.Float, nullable=False)
+    sold_at = db.Column(db.Date, nullable=False, default=datetime.date.today)
+    channel = db.Column(db.String(80), default='In-Person')  # e.g., Etsy, Fair, Online Store
+
+# -------------------- Utility --------------------
+def get_categories():
+    # derive categories present
+    rows = db.session.query(Craft.category).distinct().all()
+    return [r[0] for r in rows]
+
+# -------------------- Routes: Basic --------------------
+@app.route('/')
+def index():
+    q = request.args.get('q', '').strip().lower()
+    cat = request.args.get('category', '')
+    crafts = Craft.query
+    if q:
+        crafts = crafts.filter(db.or_(Craft.name.ilike(f'%{q}%'), Craft.materials.ilike(f'%{q}%'), Craft.notes.ilike(f'%{q}%')))
+    if cat:
+        crafts = crafts.filter_by(category=cat)
+    crafts = crafts.order_by(Craft.created_at.desc()).all()
+    return render_template('index.html', crafts=crafts, q=q, cat=cat, categories=get_categories())
+
+@app.route('/craft/new', methods=['GET','POST'])
+def craft_new():
+    if request.method == 'POST':
+        craft = Craft(
+            name=request.form['name'].strip(),
+            category=request.form['category'].strip() or 'General',
+            materials=request.form.get('materials','').strip(),
+            cost=float(request.form.get('cost') or 0),
+            price=float(request.form.get('price') or 0),
+            quantity=int(request.form.get('quantity') or 0),
+            notes=request.form.get('notes','').strip(),
+        )
+        db.session.add(craft)
+        db.session.commit()
+        flash('Craft created', 'success')
+        return redirect(url_for('index'))
+    return render_template('craft_form.html', craft=None)
+
+@app.route('/craft/<int:craft_id>')
+def craft_detail(craft_id):
+    craft = Craft.query.get_or_404(craft_id)
+    sales = Sale.query.filter_by(craft_id=craft.id).order_by(Sale.sold_at.desc()).all()
+    return render_template('craft_detail.html', craft=craft, sales=sales)
+
+@app.route('/craft/<int:craft_id>/edit', methods=['GET','POST'])
+def craft_edit(craft_id):
+    craft = Craft.query.get_or_404(craft_id)
+    if request.method == 'POST':
+        craft.name = request.form['name'].strip()
+        craft.category = request.form['category'].strip() or 'General'
+        craft.materials = request.form.get('materials','').strip()
+        craft.cost = float(request.form.get('cost') or 0)
+        craft.price = float(request.form.get('price') or 0)
+        craft.quantity = int(request.form.get('quantity') or 0)
+        craft.notes = request.form.get('notes','').strip()
+        db.session.commit()
+        flash('Craft updated', 'success')
+        return redirect(url_for('craft_detail', craft_id=craft.id))
+    return render_template('craft_form.html', craft=craft)
+
+@app.route('/craft/<int:craft_id>/delete', methods=['POST'])
+def craft_delete(craft_id):
+    craft = Craft.query.get_or_404(craft_id)
+    db.session.delete(craft)
+    db.session.commit()
+    flash('Craft deleted', 'info')
+    return redirect(url_for('index'))
+
+# -------------------- Sales --------------------
+@app.route('/craft/<int:craft_id>/sell', methods=['POST'])
+def craft_sell(craft_id):
+    craft = Craft.query.get_or_404(craft_id)
+    units = int(request.form.get('units') or 0)
+    price = float(request.form.get('unit_price') or craft.price)
+    sold_at = request.form.get('sold_at') or str(datetime.date.today())
+    channel = request.form.get('channel') or 'In-Person'
+    if units <= 0:
+        flash('Units must be positive', 'danger')
+        return redirect(url_for('craft_detail', craft_id=craft.id))
+    if craft.quantity < units:
+        flash('Not enough inventory to record this sale', 'warning')
+        return redirect(url_for('craft_detail', craft_id=craft.id))
+    sale = Sale(craft_id=craft.id, units=units, unit_price=price, sold_at=datetime.date.fromisoformat(sold_at), channel=channel)
+    craft.quantity -= units
+    db.session.add(sale)
+    db.session.commit()
+    flash('Sale recorded', 'success')
+    return redirect(url_for('craft_detail', craft_id=craft.id))
+
+@app.route('/sale/<int:sale_id>/delete', methods=['POST'])
+def sale_delete(sale_id):
+    sale = Sale.query.get_or_404(sale_id)
+    craft = sale.craft
+    # restore inventory
+    craft.quantity += sale.units
+    db.session.delete(sale)
+    db.session.commit()
+    flash('Sale deleted and inventory restored', 'info')
+    return redirect(url_for('craft_detail', craft_id=craft.id))
+
+# -------------------- Reports --------------------
+@app.route('/reports')
+def reports():
+    # Inventory metrics
+    total_items = db.session.query(func.coalesce(func.sum(Craft.quantity), 0)).scalar()
+    inventory_value = db.session.query(func.coalesce(func.sum(Craft.cost * Craft.quantity), 0.0)).scalar()
+    potential_revenue = db.session.query(func.coalesce(func.sum(Craft.price * Craft.quantity), 0.0)).scalar()
+
+    # Category breakdown
+    cat_rows = db.session.query(Craft.category, func.count(Craft.id), func.coalesce(func.sum(Craft.quantity),0)).group_by(Craft.category).all()
+    categories = [{'category': c, 'num_crafts': int(n), 'units': int(u)} for c,n,u in cat_rows]
+
+    # Sales summaries
+    sales = db.session.query(
+        Sale.channel, func.count(Sale.id), func.coalesce(func.sum(Sale.units * Sale.unit_price), 0.0)
+    ).group_by(Sale.channel).all()
+    sales_by_channel = [{'channel': ch, 'orders': int(n), 'revenue': float(rv)} for ch,n,rv in sales]
+
+    # Monthly revenue and profit (last 12 months)
+    today = datetime.date.today().replace(day=1)
+    months = []
+    monthly = []
+    for i in range(11, -1, -1):
+        m = (today - datetime.timedelta(days=31*i)).replace(day=1)
+        months.append(m.strftime('%Y-%m'))
+        # select sales in this month
+        rv = db.session.query(func.coalesce(func.sum(Sale.units * Sale.unit_price), 0.0)).filter(
+            Sale.sold_at >= m, 
+            Sale.sold_at < (m + datetime.timedelta(days=32)).replace(day=1)
+        ).scalar()
+        # estimate cost of goods sold assuming 'cost' at sale time (current cost)
+        # join sales with crafts to compute cost
+        cogs = 0.0
+        q = db.session.query(Sale.units, Craft.cost).join(Craft, Sale.craft_id == Craft.id).filter(
+            Sale.sold_at >= m,
+            Sale.sold_at < (m + datetime.timedelta(days=32)).replace(day=1)
+        )
+        for units, cost in q:
+            cogs += units * cost
+        prof = (rv or 0.0) - cogs
+        monthly.append({'month': m.strftime('%Y-%m'), 'revenue': float(rv or 0.0), 'profit': float(prof)})
+
+    return render_template('reports.html',
+                           total_items=int(total_items or 0),
+                           inventory_value=float(inventory_value or 0.0),
+                           potential_revenue=float(potential_revenue or 0.0),
+                           categories=categories,
+                           sales_by_channel=sales_by_channel,
+                           monthly=monthly)
+
+# -------------------- Export --------------------
+@app.route('/export/crafts.csv')
+def export_crafts():
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['id','name','category','materials','cost','price','quantity','notes','created_at','updated_at'])
+    for c in Craft.query.order_by(Craft.id).all():
+        writer.writerow([c.id, c.name, c.category, c.materials, c.cost, c.price, c.quantity, c.notes, c.created_at, c.updated_at])
+    mem = io.BytesIO(output.getvalue().encode('utf-8'))
+    mem.seek(0)
+    return send_file(mem, mimetype='text/csv', as_attachment=True, download_name='crafts.csv')
+
+# -------------------- Init with sample data --------------------
+@app.route('/initdb')
+def initdb():
+    db.drop_all()
+    db.create_all()
+    # seed some crafts
+    c1 = Craft(name='Macrame Wall Hanging', category='Textile', materials='Cotton cord, wooden dowel', cost=8.0, price=25.0, quantity=10, notes='Boho style.')
+    c2 = Craft(name='Soy Candle - Lavender', category='Home', materials='Soy wax, lavender oil, jar', cost=3.5, price=12.0, quantity=35)
+    c3 = Craft(name='Clay Planter', category='Ceramics', materials='Air-dry clay, sealant', cost=4.0, price=18.0, quantity=18)
+    db.session.add_all([c1,c2,c3])
+    db.session.commit()
+    # add some sales
+    s1 = Sale(craft_id=c1.id, units=3, unit_price=25.0, sold_at=datetime.date.today().replace(day=1), channel='Etsy')
+    s2 = Sale(craft_id=c2.id, units=5, unit_price=12.0, sold_at=datetime.date.today().replace(day=10), channel='Fair')
+    s3 = Sale(craft_id=c3.id, units=2, unit_price=18.0, sold_at=datetime.date.today().replace(day=5), channel='Online Store')
+    c1.quantity -= 3; c2.quantity -= 5; c3.quantity -= 2
+    db.session.add_all([s1,s2,s3])
+    db.session.commit()
+    return redirect(url_for('index'))
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
+'''
+open(f"{base}/app.py","w").write(app_py)
+
+# base.html
+base_html = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Crafts Manager</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap: 1rem; }
+    .chip { padding: .25rem .5rem; border-radius: 999px; background: var(--muted-border-color); font-size: .8rem; }
+    .right { text-align: right; }
+    .mt-2 { margin-top: .75rem; }
+    .mb-0 { margin-bottom: 0; }
+  </style>
+</head>
+<body class="container">
+  <nav>
+    <ul>
+      <li><strong>Crafts Manager</strong></li>
+    </ul>
+    <ul>
+      <li><a href="{{ url_for('index') }}">Home</a></li>
+      <li><a href="{{ url_for('craft_new') }}">Add Craft</a></li>
+      <li><a href="{{ url_for('reports') }}">Reports</a></li>
+      <li><a href="{{ url_for('export_crafts') }}">Export CSV</a></li>
+    </ul>
+  </nav>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div>
+        {% for category, message in messages %}
+          <article class="mt-2 {{ category }}"><strong>{{ category.title() }}:</strong> {{ message }}</article>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
+"""
+open(f"{base}/templates/base.html","w").write(base_html)
+
+# index.html
+index_html = """\
+{% extends 'base.html' %}
+{% block content %}
+<h2>All Crafts</h2>
+<form method="get" class="grid">
+  <input name="q" placeholder="Search by name, materials, notes" value="{{ q }}">
+  <select name="category">
+    <option value="">All categories</option>
+    {% for c in categories %}
+      <option value="{{ c }}" {% if cat==c %}selected{% endif %}>{{ c }}</option>
+    {% endfor %}
+  </select>
+  <button type="submit">Filter</button>
+</form>
+
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Category</th>
+      <th class="right">Cost</th>
+      <th class="right">Price</th>
+      <th class="right">Qty</th>
+      <th class="right">Inv. Value</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for c in crafts %}
+      <tr>
+        <td><strong><a href="{{ url_for('craft_detail', craft_id=c.id) }}">{{ c.name }}</a></strong></td>
+        <td><span class="chip">{{ c.category }}</span></td>
+        <td class="right">{{ '%.2f'|format(c.cost) }}</td>
+        <td class="right">{{ '%.2f'|format(c.price) }}</td>
+        <td class="right">{{ c.quantity }}</td>
+        <td class="right">{{ '%.2f'|format(c.inventory_value()) }}</td>
+        <td><a href="{{ url_for('craft_edit', craft_id=c.id) }}">Edit</a></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="7"><em>No crafts yet. Click "Add Craft".</em></td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
+"""
+open(f"{base}/templates/index.html","w").write(index_html)
+
+# craft_form.html
+craft_form_html = """\
+{% extends 'base.html' %}
+{% block content %}
+<h2>{{ 'Edit Craft' if craft else 'New Craft' }}</h2>
+<form method="post" class="grid">
+  <label>Name <input name="name" required value="{{ craft.name if craft }}"></label>
+  <label>Category <input name="category" value="{{ craft.category if craft }}"></label>
+  <label>Materials <input name="materials" value="{{ craft.materials if craft }}"></label>
+  <label>Cost (per unit) <input name="cost" type="number" step="0.01" value="{{ craft.cost if craft else 0 }}"></label>
+  <label>Price (per unit) <input name="price" type="number" step="0.01" value="{{ craft.price if craft else 0 }}"></label>
+  <label>Quantity <input name="quantity" type="number" value="{{ craft.quantity if craft else 0 }}"></label>
+  <label>Notes <textarea name="notes">{{ craft.notes if craft }}</textarea></label>
+  <footer>
+    <button type="submit">Save</button>
+    <a class="secondary" href="{{ url_for('index') }}">Cancel</a>
+    {% if craft %}
+    <form method="post" action="{{ url_for('craft_delete', craft_id=craft.id) }}" style="display:inline;">
+      <button class="contrast" onclick="return confirm('Delete this craft?')">Delete</button>
+    </form>
+    {% endif %}
+  </footer>
+</form>
+{% endblock %}
+"""
+open(f"{base}/templates/craft_form.html","w").write(craft_form_html)
+
+# craft_detail.html
+craft_detail_html = """\
+{% extends 'base.html' %}
+{% block content %}
+<h2>{{ craft.name }}</h2>
+<p class="mb-0">
+  <span class="chip">{{ craft.category }}</span>
+  <span class="chip">Cost: {{ '%.2f'|format(craft.cost) }}</span>
+  <span class="chip">Price: {{ '%.2f'|format(craft.price) }}</span>
+  <span class="chip">Qty: {{ craft.quantity }}</span>
+</p>
+<p><small>Materials:</small> {{ craft.materials or '-' }}</p>
+<p>{{ craft.notes }}</p>
+<p>
+  <a href="{{ url_for('craft_edit', craft_id=craft.id) }}">Edit</a>
+</p>
+
+<h3>Record a Sale</h3>
+<form method="post" action="{{ url_for('craft_sell', craft_id=craft.id) }}" class="grid">
+  <label>Units <input type="number" name="units" min="1" required></label>
+  <label>Unit Price <input type="number" name="unit_price" step="0.01" value="{{ craft.price }}"></label>
+  <label>Sold At <input type="date" name="sold_at"></label>
+  <label>Channel
+    <select name="channel">
+      <option>In-Person</option>
+      <option>Etsy</option>
+      <option>Fair</option>
+      <option>Online Store</option>
+      <option>Other</option>
+    </select>
+  </label>
+  <button type="submit">Add Sale</button>
+</form>
+
+<h3>Sales History</h3>
+<table role="grid">
+  <thead>
+    <tr><th>Date</th><th>Channel</th><th class="right">Units</th><th class="right">Unit Price</th><th class="right">Revenue</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for s in sales %}
+      <tr>
+        <td>{{ s.sold_at }}</td>
+        <td>{{ s.channel }}</td>
+        <td class="right">{{ s.units }}</td>
+        <td class="right">{{ '%.2f'|format(s.unit_price) }}</td>
+        <td class="right">{{ '%.2f'|format(s.unit_price * s.units) }}</td>
+        <td>
+          <form method="post" action="{{ url_for('sale_delete', sale_id=s.id) }}" onsubmit="return confirm('Delete sale?')">
+            <button class="contrast">Delete</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6"><em>No sales yet</em></td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% endblock %}
+"""
+open(f"{base}/templates/craft_detail.html","w").write(craft_detail_html)
+
+# reports.html
+reports_html = """\
+{% extends 'base.html' %}
+{% block content %}
+<h2>Reports</h2>
+
+<div class="metrics">
+  <article><header>Total Units</header><strong style="font-size:1.6rem">{{ total_items }}</strong></article>
+  <article><header>Inventory Value</header><strong style="font-size:1.6rem">{{ '%.2f'|format(inventory_value) }}</strong></article>
+  <article><header>Potential Revenue</header><strong style="font-size:1.6rem">{{ '%.2f'|format(potential_revenue) }}</strong></article>
+</div>
+
+<h3>By Category</h3>
+<table role="grid">
+  <thead><tr><th>Category</th><th class="right"># Crafts</th><th class="right">Units</th></tr></thead>
+  <tbody>
+    {% for r in categories %}
+      <tr><td>{{ r.category }}</td><td class="right">{{ r.num_crafts }}</td><td class="right">{{ r.units }}</td></tr>
+    {% else %}
+      <tr><td colspan="3"><em>No data</em></td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h3>Sales by Channel</h3>
+<table role="grid">
+  <thead><tr><th>Channel</th><th class="right">Orders</th><th class="right">Revenue</th></tr></thead>
+  <tbody>
+    {% for r in sales_by_channel %}
+      <tr><td>{{ r.channel }}</td><td class="right">{{ r.orders }}</td><td class="right">{{ '%.2f'|format(r.revenue) }}</td></tr>
+    {% else %}
+      <tr><td colspan="3"><em>No sales</em></td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h3>Revenue & Profit (Last 12 Months)</h3>
+<canvas id="revChart"></canvas>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+const data = {{ monthly|tojson }};
+const ctx = document.getElementById('revChart').getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: data.map(d => d.month),
+    datasets: [
+      { label: 'Revenue', data: data.map(d => d.revenue), fill: false },
+      { label: 'Profit', data: data.map(d => d.profit), fill: false }
+    ]
+  },
+  options: {
+    responsive: true,
+    scales: {
+      y: { beginAtZero: true }
+    }
+  }
+});
+</script>
+{% endblock %}
+"""
+open(f"{base}/templates/reports.html","w").write(reports_html)
+
+# README.md
+readme = """\
+#
